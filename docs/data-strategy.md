@@ -4,215 +4,108 @@
 
 Sport Data Hub의 장기 목표는 기록 조회 페이지가 아니라 **팀과 선수를 데이터로 이해할 수 있는 분석 플랫폼**입니다.
 
-이를 위해서는 화면 요청이 올 때마다 외부 API를 호출하는 방식만으로는 충분하지 않습니다. 데이터의 변경 주기, 재사용성, 분석 비용에 따라 **API / Cache / Operational DB / Warehouse**의 역할을 나누는 것이 필요합니다.
+이를 위해서는 화면 요청이 올 때마다 외부 API를 호출하는 방식만으로는 충분하지 않습니다. 데이터의 변경 주기, 재사용성, 분석 비용에 따라 **API / Cache / Operational DB / Warehouse**의 역할을 나눴고, 창고의 앞 두 층은 만들어져 운영 중입니다.
 
 ## 1. Data classification
 
-### A. Frequently changing serving data
+| 종류 | 예 | 지금 |
+|---|---|---|
+| A. 자주 바뀌는 서빙 데이터 | 진행 중 경기, 점수 | 원천 → 30초 캐시 → 화면 |
+| B. 느리게 바뀌는 선수 데이터 | 프로필, 시즌 누적 | 원천 → 선수 단위 캐시(시간) → 화면 |
+| C. 끝나면 안 바뀌는 경기 데이터 | 종료된 경기 결과, 경기 피드 | **결과는 Postgres, 피드는 R2 창고** |
+| D. 제품 행동 데이터 | 조회, 관심 선수, 대표팀 | Postgres |
 
-예:
-- 진행 중 경기
-- 경기 상태
-- 점수
+C가 이 문서의 주제입니다.
 
-특징:
-- 최신성이 중요
-- 장기 저장보다 짧은 조회 주기가 중요
+## 2. Where the warehouse lives: 결정의 경위
 
-현재 방향:
-```text
-Source API → short-lived cache → Serving API
-```
+처음 계획은 MotherDuck이었고, 다음은 Postgres 마트였고, 그다음은 OCI로 백엔드·DB를 통째로 옮기는 것이었습니다. 결국 Cloudflare R2에 Parquet으로 정했습니다. 경위가 곧 판단 기준이라 남깁니다.
 
-### B. Slowly changing player data
+| 후보 | 왜 안 됐나 |
+|---|---|
+| Postgres(Supabase) 마트 | 경기 피드를 시즌 단위로 쌓으면 **시즌당 143MB**(행 부담과 인덱스). 무료 한도 500MB의 29%. 두 시즌이면 57% |
+| OCI 이전 | 위 제약을 풀려고 DB 이전까지 계획했다가, 마트를 창고에 두면 그 제약이 사라진다는 것을 알고 중단. 혼자 운영하는 서비스에 인프라를 크게 가져갈 이유가 없었다 |
+| MotherDuck | 거래처가 하나 는다. 프론트·워커·크론이 이미 Cloudflare에 있다 |
+| **Cloudflare R2** | S3와 API가 같아 DuckDB의 `httpfs`가 그대로 붙는다(AWS 계정 불필요). 무료 한도 저장 10GB · Class A(쓰기·목록) 100만/월 · Class B(읽기) 1000만/월 · egress 무료 |
 
-예:
-- 선수 프로필
-- 현재 팀
-- 시즌 누적 기록
+실측 근거입니다.
 
-특징:
-- 매 요청마다 upstream을 호출할 필요가 없음
-- 경기 단위 또는 시간 단위로 변함
+- 경기 하나의 원본 JSON은 599KB, gzip 109KB, **Parquet + zstd 75KB**
+- 시즌당 17~25MB. 10시즌이 1.5GB로 무료 한도의 15%
+- zstd 레벨을 3에서 22로 올려도 0.7%만 줄어 기본 레벨로 충분(열 지향 인코딩이 이미 다 했다)
+- Fly(도쿄)에서 R2 조회 왕복 130~190ms. 화면에 쓸 만하다
 
-현재 방향:
-```text
-Source API → player-level cache → Serving API
-```
-
-### C. Immutable / historical game data
-
-예:
-- 종료된 경기 play-by-play
-- 과거 투구 데이터
-- 이전 시즌 기록
-
-특징:
-- 경기가 종료된 이후 거의 변하지 않음
-- 여러 분석에서 반복 사용 가능
-- cache에서 계속 다시 가져오는 것보다 저장 가치가 높음
-
-향후 방향:
-```text
-Source API
-   ↓
-Ingestion
-   ↓
-Raw Game Data
-   ↓
-Normalized / Curated Data
-   ↓
-Analytics + Serving
-```
-
-### D. Product behavior data
-
-예:
-- 선수 조회
-- 관심 선수
-- 검색 진입 경로
-
-특징:
-- 원천 스포츠 API에는 존재하지 않음
-- 서비스가 직접 만드는 데이터
-- 제품 개선과 추천에 활용 가능
-
-현재:
-```text
-User action → FastAPI → PostgreSQL
-```
-
-## 2. Cache or Warehouse?
-
-새 데이터를 무조건 cache하거나 무조건 DW에 적재하지 않습니다.
-
-다음 질문을 기준으로 판단합니다.
-
-1. 데이터가 얼마나 자주 바뀌는가?
-2. 같은 데이터를 얼마나 자주 다시 읽는가?
-3. 원천 API latency와 호출 비용은 어느 정도인가?
-4. 원천을 다시 호출해도 되는 데이터인가?
-5. 여러 사용자/분석이 같은 데이터를 재사용하는가?
-6. request path에서 계산하기에 연산량이 큰가?
-7. 과거 시점의 상태를 다시 분석해야 하는가?
-
-### Example: completed play-by-play
-
-현재 경기별 play-by-play는 cache 대상입니다.
-
-그러나 완료된 경기는 더 이상 바뀌지 않기 때문에 사용자와 분석 기능이 늘어난다면 아래와 같은 구조가 더 적합합니다.
-
-```mermaid
-flowchart LR
-    MLB[MLB Stats API] --> Ingest[Game Ingestion]
-    Ingest --> Raw[(Raw)]
-    Raw --> Transform[Transform]
-    Transform --> Fact[(Pitch / Play Facts)]
-    Fact --> Analytics[Analytics]
-    Fact --> API[Serving API]
-```
-
-이렇게 되면 선수 상세 페이지뿐 아니라 팀 분석, 구종 분석, matchup 분석 등 여러 기능이 같은 데이터를 재사용할 수 있습니다.
-
-## 3. Proposed warehouse layers
-
-아직 production으로 구축한 구조는 아니며 향후 확장안입니다.
-
-### Raw
-
-원천 데이터를 가능한 한 원형에 가깝게 저장합니다.
-
-예:
-```text
-raw_games
-raw_play_by_play
-raw_players
-raw_rosters
-```
-
-목적:
-- 원천 변경 대응
-- 재처리 가능성 확보
-- 데이터 lineage 유지
-
-### Curated
-
-서비스가 공통으로 사용하는 의미 단위로 정규화합니다.
-
-예:
-```text
-dim_player
-dim_team
-fact_game
-fact_player_game
-fact_pitch
-```
-
-### Analytics
-
-제품 기능에 가까운 파생 데이터를 만듭니다.
-
-예:
-```text
-team_strength_profile
-player_skill_profile
-team_position_need
-player_team_fit
-```
-
-## 4. From stats to team diagnosis
-
-최종적으로 만들고 싶은 기능은 단순한 리더보드가 아닙니다.
-
-예를 들어 한 팀을 다음과 같이 설명할 수 있어야 합니다.
+## 3. Bronze: 온 대로, 값 무변환
 
 ```text
-Team
- ├─ Run creation
- ├─ Plate discipline
- ├─ Contact quality
- ├─ Starting pitching
- ├─ Bullpen
- ├─ Defense
- └─ Positional depth
+bronze/play_event/season=2026/date=2026-09-06/events.parquet
 ```
 
-각 축을 리그 평균 및 유사 팀과 비교하면 팀의 강점과 약점을 구조적으로 설명할 수 있습니다.
+- `playByPlay`의 모든 `playEvents`를 한 행씩 폅니다. 투구가 85.8%, 나머지는 교체·견제·발빼기입니다. 지금 화면이 쓰는 것은 투구뿐이지만 브론즈는 나중에 무엇을 뽑을지 모르는 상태로 두는 층입니다. 그래서 이름이 `pitch`가 아니라 `play_event`입니다
+- 중첩은 밑줄로 편 이름(`pitchData_coordinates_pX`)이고, 배열(주자 이동)은 JSON 문자열로 둡니다. 열로 펴면 행이 곱해져 "이벤트 하나가 한 행"이 깨집니다
+- 스키마를 미리 정하지 않습니다. 상황이 있을 때만 오는 열(주자·판독·위반)은 그날 없으면 열 자체가 없고, 읽을 때 `union_by_name`으로 합칩니다. 시즌 92일치 합집합이 151열, 파일마다 타입이 다른 열은 0개였습니다
+- 날짜 하나가 파일 하나입니다. 경기별로 쪼개면 시즌당 2,000개가 넘어 목록 조회가 비싸지고, 월별로 묶으면 하루를 다시 담으려고 한 달을 다시 써야 합니다. `season=`·`date=`가 디렉터리여야 DuckDB가 경로에서 값을 뽑습니다
+- 담을 날짜는 `game_day.settled_at`(경기 적재 배치가 찍는 확정 표시)에서 오고, 이미 파일이 있는 날짜는 건너뜁니다. 목록 조회는 실행당 한 번입니다(Class A)
+- 경기 하나가 실패하면 그날 파일을 쓰지 않습니다. 반쪽 파일이 남으면 "담긴 날짜"로 보여 영영 다시 안 담깁니다
 
-그 다음 단계는 선수 데이터와 연결하는 것입니다.
+### 왜 월별로 묶지 않았나
+
+묶으면 확실히 나은 것이 하나 있습니다. 4월 30일치를 파일 하나로 묶어 재 보니 콜드 조회가 **8.14초에서 0.57초**로, 14배 빨라졌습니다. 그런데 묶는 데 **512MB**가 필요했습니다(256MB·384MB에서 메모리 부족). 배치 머신이 512MB라 운영에서는 못 합니다. 그리고 하루를 다시 담으려면 그 달 전체를 원천에서 다시 받아야 합니다. Class A 쓰기 비용은 애초에 판단 근거가 아니었습니다. 시즌 161번이 무료 한도의 0.016%입니다.
+
+그래서 브론즈는 쓰기 쪽 요구(하루 단위로 실패하고 다시 담는다)에 맞추고, 읽기 쪽 요구(한 번에 훑는다)는 마트가 맡습니다. 층을 나눈 이유가 이것입니다.
+
+## 4. Silver: 고정 스키마, 행 수 같음
 
 ```text
-Team weakness
-   ↓
-Required skill profile
-   ↓
-Candidate player filtering
-   ↓
-Player-team fit score
-   ↓
-Explanation
+silver/play_event/season=2026/date=2026-09-06/events.parquet
 ```
 
-중요한 목표는 단순 점수 하나를 보여주는 것이 아니라 **왜 이 선수가 이 팀에 필요한지를 데이터로 설명하는 것**입니다.
+- 127열(브론즈에서 그대로 117 + 파생 10). 표시용 28열(이름·링크·설명 문자열·색상)은 뺍니다. 전부 id로 다시 붙일 수 있고 브론즈에는 남아 있습니다
+- **값을 바꾸지 않습니다.** 하는 것은 타입 고정, 없는 열 NULL, 파생 열, 경기 표 조인뿐입니다. 시각 문자열도 VARCHAR 그대로이고 파싱은 마트가 합니다
+- **행을 거르지 않습니다.** 투구가 아닌 행은 파생 열(스윙·헛스윙·존·마지막 투구)이 `False`가 아니라 NULL입니다. `False`로 두면 `avg(swung)`의 분모가 부풉니다
+- 스윙·헛스윙의 코드 집합은 화면 코드와 같은 상수를 씁니다. 창고와 화면이 다른 규칙으로 스윙을 세면 같은 투수의 스윙률이 두 값이 됩니다
+- 변환은 DuckDB SQL 한 문장입니다. 파이썬은 그날 브론즈의 열 목록을 보고 있는 열은 `cast`, 없는 열은 `NULL::타입`으로 select를 조립합니다. 파생 식도 cast된 열을 참조합니다. 원본 열을 그대로 쓰면 타입 드리프트 때 cast 오류가 아니라 바인딩 오류로 먼저 터져 열 이름이 실린 문구를 못 만듭니다(테스트가 잡아냈습니다)
+- 실측 검증: 이틀치를 만들어 행 수(5,042 · 3,638)가 브론즈·장부와 같고, 두 파일의 스키마가 글자까지 같고, 경기마다 마지막 투구 수가 타석 수와 같고, 스윙 46.6%·헛스윙 10.9%로 리그 평균(47%·11%) 근처인 것을 확인했습니다
 
-## 5. Multi-sport direction
+### 장부와 버전
 
-모든 스포츠의 스키마를 억지로 하나로 합치는 것을 목표로 하지는 않습니다.
+`silver_day(slate_date, version, rows, built_at)`가 결정합니다. parquet KV 메타데이터 방식과 견줬을 때 관측이 결정적이었습니다. "어느 날짜가 낡았나"가 SELECT 하나이고 `rows`·`built_at`이 붙습니다. footer 161개를 매번 읽는 것과 견줄 것이 아닙니다. 파일은 쓴 다음에 장부를 적습니다. 반대 순서면 "장부엔 있는데 파일이 없는" 날이 영영 안 만들어집니다.
 
-야구의 pitch, Formula 1의 lap, 농구의 possession은 같은 event가 아닙니다. 따라서 세부 fact는 스포츠별 모델을 유지하는 편이 자연스럽습니다.
+## 5. Drift sensing
 
-대신 사용자 경험과 상위 분석 개념에서 공통 축을 찾습니다.
+브론즈는 스키마가 없어서 원천이 필드를 더하거나 타입을 바꿔도 아무도 모릅니다. 그래서 브론즈 배치에 눈을 붙였습니다.
 
-예:
-```text
-Sport
-Team / Constructor
-Player / Driver
-Season
-Event / Game / Race
-Performance Metric
-Ranking
-Strength / Weakness
-```
+| 그날 것 | 판정 |
+|---|---|
+| 기준선에 없는 열 | 알림. 넣는다(`first_seen` = 슬레이트 날짜) |
+| 있는 열인데 타입이 다르다 | 알림. 타입 갱신 |
+| 있는 열이 그날 없다 | 아무것도 안 함 (상황 열) |
+| 감시 열(`type` · `details_call_code` · `play_result_eventType`)에 처음 보는 값 | 알림. 넣는다 |
 
-즉 **storage model의 완전한 통합보다, 분석과 탐색 경험의 통합**을 지향합니다.
+기준선은 JSON 파일이 아니라 Postgres 표(`bronze_column` · `bronze_value`)입니다. 센싱이 알고 싶은 것은 "이 열을 처음 본 날이 언제인가"라는 데이터에 대한 사실이고, 사실은 코드가 아니라 데이터 저장소에 있어야 합니다. 새 열이 오면 배치가 넣고 알리며, 받아들이는 데 배포가 필요 없습니다. `first_seen`은 실행일이 아니라 슬레이트 날짜라 백필이 3월치를 9월에 담아도 "3월부터 있던 열"로 남습니다.
+
+실버 쪽 실패는 다릅니다. 담는 열의 cast가 실패하면 그날은 실패하고 매일 다시 시도하며 알립니다. 브론즈는 무사합니다. 문구에는 날짜, 열, 개수, 예시 값, 그리고 브론즈가 무사하다는 것과 복구 방법이 담깁니다.
+
+## 6. What the invariant caught
+
+실버의 "행 수가 같아야 한다"는 강제가 원천 데이터 모델의 문제를 잡았습니다. MLB Stats API는 같은 경기 id를 이틀에 싣습니다. 중단됐다가 다음 날 재개된 경기(양쪽 다 `Final`, 공식 경기일은 원래 날)와 연기됐다가 같은 id로 다른 날 치른 경기(원래 날 `Postponed`, 공식 경기일은 치른 날)입니다. 경기 표가 경기 id를 기본키로 쓰고 적재한 날을 `slate_date`로 넣어 덮어쓰니, 어느 날을 나중에 담았느냐가 값을 정했습니다.
+
+고침은 "공식 경기일이 그날인 목록만 행을 소유하고, 아닌 목록은 없을 때만 넣는다"입니다. 어느 순서로 담아도 행이 공식 경기일 쪽에 남습니다. 잘못 나뉜 브론즈 9일은 지우고 다시 담아 실버까지 다시 만들었습니다.
+
+## 7. Next: mart and the read path
+
+| 단계 | 무엇 | 왜 |
+|---|---|---|
+| 마트 | 실버 날짜 파일을 시즌 파일 하나로 합친다. 투구만, 화면 열만, 투수순 정렬 | 화면이 읽는 층은 합쳐져 있어야 한다(92파일 콜드 23초 대 1파일 0.57초). 512MB 넘게 들면 배치 머신에 메모리를 더 준다 |
+| 읽기 전환 | 투수 상세가 원천 22~41회 대신 마트 1회 | 원천 의존 최소화의 실제 수확 |
+| 첫 시각화 | 스프레이 산포도, 핫콜드 좌·우완 | 창고가 있어야 가능한 첫 기능 |
+
+마트 장부는 `mart_build(name, season, silver_version, mart_version, through_date, rows, built_at)`로 마트 자신의 출처를 적습니다. 실버 처리 기록이 아니라 "어느 실버 날짜까지 어느 버전으로 만들었는가"입니다.
+
+## 8. From stats to team diagnosis
+
+최종적으로 만들고 싶은 기능은 단순한 리더보드가 아닙니다. 한 팀을 공격 생산성, 선구안, 타구 질, 선발, 불펜, 수비, 포지션 depth로 설명하고, 약점을 선수의 skill profile과 연결해 **왜 이 선수가 이 팀에 필요한지를 데이터로 설명하는 것**입니다. 창고는 그 계산이 사용자 요청 안이 아니라 배치에서 돌게 하는 기반입니다.
+
+## 9. Multi-sport direction
+
+모든 스포츠의 스키마를 억지로 하나로 합치지 않습니다. 야구의 pitch, Formula 1의 lap, 농구의 possession은 같은 event가 아닙니다. 세부 fact는 스포츠별 모델을 유지하고, 사용자 경험과 상위 분석 개념(팀·선수·시즌·경기·지표·순위·강점/약점)에서 공통 축을 찾습니다. **storage model의 완전한 통합보다, 분석과 탐색 경험의 통합**을 지향합니다.
