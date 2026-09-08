@@ -1,8 +1,21 @@
+<div align="center">
+
+<img src="imgs/icon-512.png" width="112" alt="sport-data-hub" />
+
 # Sport Data Hub
 
-> **최신 반영 기준:** 2026-09-09 확인, 서비스 `main`의 2026-09-08 변경분까지 반영했습니다. 구현 근거와 범위는 [동기화 기록](docs/source-sync.md)에 정리했습니다.
+**멀티 스포츠 데이터 플랫폼**
 
-> 일반 팬도 이해할 수 있는 스포츠 데이터 분석 경험을 만들고, 장기적으로는 종목을 넘어 팀과 선수를 함께 분석하는 데이터 플랫폼을 지향합니다.
+[Let's go to the Sport Data Hub ⚾️](https://sport-data-hub.net/)
+
+일반 팬도 이해할 수 있는 스포츠 데이터 분석 경험을 만들고, 장기적으로는 종목을 넘어 팀과 선수를 함께 분석하는 데이터 플랫폼을 지향합니다.
+
+[![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)](https://react.dev/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-6-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
+[![Status](https://img.shields.io/badge/status-Live-d97757)](#status)
+
+</div>
+
 
 ## Why this project
 
